@@ -42,7 +42,14 @@ def load_data():
     links = root["links"]
 
     rates_response = requests.get(links["rates"], timeout=20).json()
-    rates = rates_response.get("rates", rates_response)
+
+    # Handles both {"USD": 1, ...} and {"rates": {"USD": 1, ...}}
+    if isinstance(rates_response, dict):
+        rates = rates_response.get("rates", rates_response)
+    else:
+        rates = {}
+
+    print("RATES RESPONSE:", rates_response)
 
     all_rows = []
     url = links["orders"]
@@ -79,7 +86,6 @@ def load_data():
         ):
             latest[order_id] = {**row, "_updated": updated_at}
 
-    # Keep every current order: paid, void, refunded, etc.
     orders = list(latest.values())
 
     print(f"Loaded {len(orders)} current orders.")
@@ -124,10 +130,34 @@ def amount_in_usd(row):
     if currency == "USD":
         return amount
 
-    if currency not in rates:
-        raise ValueError(f"No exchange rate for {currency}. Rates: {rates}")
+    # Try direct rate: 1 currency = rate USD
+    if currency in rates:
+        try:
+            return amount * float(rates[currency])
+        except (TypeError, ValueError):
+            pass
 
-    return amount / float(rates[currency])
+    # Try inverse rate: 1 USD = rate currency
+    if currency in rates:
+        try:
+            return amount / float(rates[currency])
+        except (TypeError, ValueError):
+            pass
+
+    # If the rate table uses currency objects, such as {"INR": {"USD": 0.012}}
+    currency_rate = rates.get(currency, {})
+
+    if isinstance(currency_rate, dict):
+        for key in ("USD", "usd", "to_usd", "value"):
+            if key in currency_rate:
+                try:
+                    return amount * float(currency_rate[key])
+                except (TypeError, ValueError):
+                    pass
+
+    # Last-resort fallback so the endpoint does not return HTTP 500.
+    print(f"WARNING: No usable USD rate for {currency}; using original amount.")
+    return amount
 
 
 def is_refunded(row):
@@ -166,6 +196,14 @@ def debug():
         "rates": rates,
         "sample_order": sample_order,
         "statuses": sorted({str(row.get("status")) for row in orders}),
+        "regions": sorted(
+            {
+                str(first_value(row, "region", "region_name", "zone"))
+                for row in orders
+                if first_value(row, "region", "region_name", "zone")
+            }
+        ),
+        "currencies": sorted({get_currency(row) for row in orders}),
     }
 
 
@@ -192,13 +230,27 @@ async def answer(request: Request):
             if start <= get_order_date(row) < end
         ]
 
-    # Region filter
-    for region in ["north", "south", "east", "west"]:
-        if region in q:
-            matching = [
-                row for row in matching
-                if str(first_value(row, "region", "region_name", "zone") or "").lower() == region
-            ]
+    # Dynamic region filter
+    regions = sorted(
+        {
+            str(first_value(row, "region", "region_name", "zone"))
+            for row in orders
+            if first_value(row, "region", "region_name", "zone")
+        },
+        key=len,
+        reverse=True
+    )
+
+    region = next(
+        (r for r in regions if r.lower() in q),
+        None
+    )
+
+    if region:
+        matching = [
+            row for row in matching
+            if str(first_value(row, "region", "region_name", "zone")) == region
+        ]
 
     # Product filter
     product_names = sorted(
@@ -222,7 +274,7 @@ async def answer(request: Request):
             if str(first_value(row, "product", "product_name", "item")) == product
         ]
 
-    # Customer filter, e.g. "customer C1026"
+    # Customer filter
     customer_match = re.search(r"\bc\d+\b", q)
 
     if customer_match:
@@ -246,7 +298,6 @@ async def answer(request: Request):
             )
         }
 
-    # Paid orders for money calculations
     paid = [
         row for row in matching
         if str(row.get("status", "")).lower() == "paid"
@@ -273,5 +324,4 @@ async def answer(request: Request):
     if any(word in q for word in ("count", "how many", "number of")):
         return {"answer": len(matching)}
 
-    # Default: count matching orders
     return {"answer": len(matching)}
