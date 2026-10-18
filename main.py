@@ -53,7 +53,9 @@ def load_data():
         rows = find_list(page)
 
         if rows is None:
-            raise ValueError(f"Could not find orders list. Page keys: {list(page.keys())}")
+            raise ValueError(
+                f"Could not find orders list. Page keys: {list(page.keys())}"
+            )
 
         if not sample_order and rows:
             sample_order = rows[0]
@@ -71,15 +73,16 @@ def load_data():
         if order_id is None or updated_at is None:
             raise ValueError(f"Missing ID or updated_at in row: {row}")
 
-        if order_id not in latest or str(updated_at) > str(latest[order_id]["_updated"]):
+        if (
+            order_id not in latest
+            or str(updated_at) > str(latest[order_id]["_updated"])
+        ):
             latest[order_id] = {**row, "_updated": updated_at}
 
-    orders = [
-        row for row in latest.values()
-        if str(row.get("status", "")).lower() == "paid"
-    ]
+    # Keep every current order: paid, void, refunded, etc.
+    orders = list(latest.values())
 
-    print(f"Loaded {len(orders)} paid orders.")
+    print(f"Loaded {len(orders)} current orders.")
 
 
 def get_order_date(row):
@@ -127,6 +130,11 @@ def amount_in_usd(row):
     return amount / float(rates[currency])
 
 
+def is_refunded(row):
+    status = str(row.get("status", "")).lower()
+    return status in ("refund", "refunded") or get_amount(row) < 0
+
+
 def month_bounds(month_name, year):
     months = [
         "january", "february", "march", "april", "may", "june",
@@ -157,6 +165,7 @@ def debug():
         "orders_loaded": len(orders),
         "rates": rates,
         "sample_order": sample_order,
+        "statuses": sorted({str(row.get("status")) for row in orders}),
     }
 
 
@@ -167,6 +176,7 @@ async def answer(request: Request):
 
     matching = orders
 
+    # Date filter
     year_match = re.search(r"\b(20\d{2})\b", q)
     month_match = re.search(
         r"\b(january|february|march|april|may|june|july|august|september|october|november|december)\b",
@@ -182,6 +192,7 @@ async def answer(request: Request):
             if start <= get_order_date(row) < end
         ]
 
+    # Region filter
     for region in ["north", "south", "east", "west"]:
         if region in q:
             matching = [
@@ -189,6 +200,7 @@ async def answer(request: Request):
                 if str(first_value(row, "region", "region_name", "zone") or "").lower() == region
             ]
 
+    # Product filter
     product_names = sorted(
         {
             str(first_value(row, "product", "product_name", "item"))
@@ -210,12 +222,47 @@ async def answer(request: Request):
             if str(first_value(row, "product", "product_name", "item")) == product
         ]
 
-    if "refund" in q:
+    # Customer filter, e.g. "customer C1026"
+    customer_match = re.search(r"\bc\d+\b", q)
+
+    if customer_match:
+        customer_id = customer_match.group(0).upper()
         matching = [
             row for row in matching
-            if get_amount(row) < 0
+            if str(first_value(row, "customer", "customer_id", "customerid") or "").upper() == customer_id
         ]
 
-    total = sum(amount_in_usd(row) for row in matching)
+    # Refund questions
+    if "refund" in q:
+        refunded = [row for row in matching if is_refunded(row)]
 
-    return {"answer": round(total, 2)}
+        if any(word in q for word in ("count", "how many", "number of")):
+            return {"answer": len(refunded)}
+
+        return {
+            "answer": round(
+                sum(amount_in_usd(row) for row in refunded),
+                2
+            )
+        }
+
+    # Revenue questions: only paid orders count as revenue
+    if any(word in q for word in ("revenue", "sales", "total", "amount", "spend", "spent")):
+        matching = [
+            row for row in matching
+            if str(row.get("status", "")).lower() == "paid"
+        ]
+
+        return {
+            "answer": round(
+                sum(amount_in_usd(row) for row in matching),
+                2
+            )
+        }
+
+    # Count questions without the word "refund"
+    if any(word in q for word in ("count", "how many", "number of")):
+        return {"answer": len(matching)}
+
+    # Default: count matching orders
+    return {"answer": len(matching)}
