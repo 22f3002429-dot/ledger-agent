@@ -111,19 +111,26 @@ def amount_in_usd(row):
     if currency == "USD":
         return amount
 
+    # Rates are treated as: 1 USD = rates[currency]
+    # Therefore foreign amount -> USD uses division.
     if currency in rates:
         try:
-            return amount * float(rates[currency])
+            rate = float(rates[currency])
+            if rate != 0:
+                return amount / rate
         except (TypeError, ValueError):
             pass
 
+    # Fallback for a nested rate format.
     currency_rate = rates.get(currency, {})
 
     if isinstance(currency_rate, dict):
         for key in ("USD", "usd", "to_usd", "value"):
             if key in currency_rate:
                 try:
-                    return amount * float(currency_rate[key])
+                    rate = float(currency_rate[key])
+                    if rate != 0:
+                        return amount / rate
                 except (TypeError, ValueError):
                     pass
 
@@ -265,15 +272,7 @@ async def answer(request: Request):
         if str(row.get("status", "")).lower() == "paid"
     ]
 
-    wants_count = any(
-        word in q for word in ("count", "how many", "number of")
-    )
-
-    wants_average = any(
-        word in q for word in ("average", "avg", "mean", "typically worth")
-    )
-
-    # Top / best product or customer by revenue or orders
+    # Top / best product or customer by revenue
     top_match = re.search(
         r"(top|best|highest|most)\s*(?:[-\s])?(selling|revenue|revenue-generating|valuable)?\s*(product|item|customer)",
         q
@@ -282,10 +281,7 @@ async def answer(request: Request):
     if top_match:
         group = top_match.group(3)
 
-        if group in ("product", "item"):
-            key_func = get_product
-        else:
-            key_func = get_customer
+        key_func = get_product if group in ("product", "item") else get_customer
 
         totals = {}
 
@@ -293,8 +289,7 @@ async def answer(request: Request):
             name = key_func(row)
             totals[name] = totals.get(name, 0) + amount_in_usd(row)
 
-        best = max(totals, key=totals.get)
-        return {"answer": best}
+        return {"answer": max(totals, key=totals.get)}
 
     # Which product/customer questions
     if "which product" in q or "which item" in q:
@@ -316,7 +311,7 @@ async def answer(request: Request):
         return {"answer": max(totals, key=totals.get)}
 
     # Average value
-    if wants_average:
+    if any(word in q for word in ("average", "avg", "mean", "typically worth")):
         if not paid:
             return {"answer": 0}
 
@@ -328,7 +323,7 @@ async def answer(request: Request):
         }
 
     # Count questions
-    if wants_count:
+    if any(word in q for word in ("count", "how many", "number of")):
         return {"answer": len(matching)}
 
     # Revenue / money questions
@@ -343,5 +338,4 @@ async def answer(request: Request):
             )
         }
 
-    # Default: count matching orders
     return {"answer": len(matching)}
