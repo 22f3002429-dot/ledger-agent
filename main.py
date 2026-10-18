@@ -1,7 +1,7 @@
 """Acme ledger agent: POST {"question": "..."} -> {"answer": ...}
 
 The LLM only turns the question into a JSON spec; all numbers are computed here.
-Env vars: EXPORT_URL (signed .../export link), ANTHROPIC_API_KEY, optional MODEL.
+Env vars: EXPORT_URL (signed ./export link), GEMINI_API_KEY, optional GEMINI_MODEL.
 """
 import asyncio
 import json
@@ -206,25 +206,21 @@ Return the JSON object only."""
 
 async def question_to_spec(question, cat):
     today = (datetime.now(timezone.utc) + timedelta(hours=5, minutes=30)).date().isoformat()
+    model = os.environ.get("GEMINI_MODEL", "gemini-2.0-flash")
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
     async with httpx.AsyncClient(timeout=9.0) as client:
         res = await client.post(
-            "https://api.anthropic.com/v1/messages",
-            headers={
-                "x-api-key": os.environ["ANTHROPIC_API_KEY"],
-                "anthropic-version": "2023-06-01",
-                "content-type": "application/json",
-            },
+            url,
+            headers={"x-goog-api-key": os.environ["GEMINI_API_KEY"], "content-type": "application/json"},
             json={
-                "model": os.environ.get("MODEL", "claude-haiku-5-5"),
-                "max_tokens": 700,
-                "temperature": 0,
-                "system": system_prompt(cat, today),
-                "messages": [{"role": "user", "content": question}],
+                "systemInstruction": {"parts": [{"text": system_prompt(cat, today)}]},
+                "contents": [{"role": "user", "parts": [{"text": question}]}],
+                "generationConfig": {"temperature": 0, "responseMimeType": "application/json"},
             },
         )
     if res.status_code != 200:
         raise RuntimeError(f"LLM {res.status_code}: {res.text[:200]}")
-    text = "".join(c.get("text", "") for c in res.json().get("content", []))
+    text = "".join(p.get("text", "") for p in res.json()["candidates"][0]["content"]["parts"])
     a, b = text.find("{"), text.rfind("}")
     if a < 0 or b < 0:
         raise RuntimeError("no JSON in LLM output")
