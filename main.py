@@ -10,7 +10,6 @@ app = FastAPI()
 
 orders = []
 rates = {}
-sample_order = {}
 
 
 def first_value(row, *names):
@@ -36,7 +35,7 @@ def find_next(page):
 
 
 def load_data():
-    global orders, rates, sample_order
+    global orders, rates
 
     root = requests.get(START_URL, timeout=20).json()
     links = root["links"]
@@ -47,8 +46,6 @@ def load_data():
         rates = rates_response.get("rates", rates_response)
     else:
         rates = {}
-
-    print("RATES RESPONSE:", rates_response)
 
     all_rows = []
     url = links["orders"]
@@ -62,10 +59,6 @@ def load_data():
             raise ValueError(
                 f"Could not find orders list. Page keys: {list(page.keys())}"
             )
-
-        if not sample_order and rows:
-            sample_order = rows[0]
-            print("SAMPLE ORDER:", sample_order)
 
         all_rows.extend(rows)
         url = find_next(page)
@@ -87,8 +80,6 @@ def load_data():
 
     orders = list(latest.values())
 
-    print(f"Loaded {len(orders)} current orders.")
-
 
 def get_order_date(row):
     value = first_value(
@@ -102,24 +93,15 @@ def get_order_date(row):
         "timestamp"
     )
 
-    if value is None:
-        raise ValueError(f"No date field found in row: {row}")
-
     return datetime.fromisoformat(str(value).replace("Z", "+00:00"))
 
 
 def get_amount(row):
-    value = first_value(row, "amount", "total", "value", "revenue")
-
-    if value is None:
-        raise ValueError(f"No amount field found in row: {row}")
-
-    return float(value)
+    return float(first_value(row, "amount", "total", "value", "revenue"))
 
 
 def get_currency(row):
-    value = first_value(row, "currency", "currency_code", "curr")
-    return str(value or "USD").upper()
+    return str(first_value(row, "currency", "currency_code", "curr") or "USD").upper()
 
 
 def amount_in_usd(row):
@@ -145,7 +127,6 @@ def amount_in_usd(row):
                 except (TypeError, ValueError):
                     pass
 
-    print(f"WARNING: No usable USD rate for {currency}; using original amount.")
     return amount
 
 
@@ -173,6 +154,18 @@ def month_bounds(month_name, year):
     return start, end
 
 
+def get_product(row):
+    return str(first_value(row, "product", "product_name", "item") or "")
+
+
+def get_customer(row):
+    return str(first_value(row, "customer", "customer_id", "customerid") or "")
+
+
+def get_region(row):
+    return str(first_value(row, "region", "region_name", "zone") or "")
+
+
 @app.on_event("startup")
 def startup():
     load_data()
@@ -183,15 +176,9 @@ def debug():
     return {
         "orders_loaded": len(orders),
         "rates": rates,
-        "sample_order": sample_order,
         "statuses": sorted({str(row.get("status")) for row in orders}),
-        "regions": sorted(
-            {
-                str(first_value(row, "region", "region_name", "zone"))
-                for row in orders
-                if first_value(row, "region", "region_name", "zone")
-            }
-        ),
+        "regions": sorted({get_region(row) for row in orders if get_region(row)}),
+        "products": sorted({get_product(row) for row in orders if get_product(row)}),
         "currencies": sorted({get_currency(row) for row in orders}),
     }
 
@@ -219,48 +206,34 @@ async def answer(request: Request):
             if start <= get_order_date(row) < end
         ]
 
-    # Dynamic region filter
+    # Region filter
     regions = sorted(
-        {
-            str(first_value(row, "region", "region_name", "zone"))
-            for row in orders
-            if first_value(row, "region", "region_name", "zone")
-        },
+        {get_region(row) for row in orders if get_region(row)},
         key=len,
         reverse=True
     )
 
-    region = next(
-        (r for r in regions if r.lower() in q),
-        None
-    )
+    region = next((r for r in regions if r.lower() in q), None)
 
     if region:
         matching = [
             row for row in matching
-            if str(first_value(row, "region", "region_name", "zone")) == region
+            if get_region(row) == region
         ]
 
     # Product filter
-    product_names = sorted(
-        {
-            str(first_value(row, "product", "product_name", "item"))
-            for row in orders
-            if first_value(row, "product", "product_name", "item")
-        },
+    products = sorted(
+        {get_product(row) for row in orders if get_product(row)},
         key=len,
         reverse=True
     )
 
-    product = next(
-        (p for p in product_names if p.lower() in q),
-        None
-    )
+    product = next((p for p in products if p.lower() in q), None)
 
     if product:
         matching = [
             row for row in matching
-            if str(first_value(row, "product", "product_name", "item")) == product
+            if get_product(row) == product
         ]
 
     # Customer filter
@@ -270,7 +243,7 @@ async def answer(request: Request):
         customer_id = customer_match.group(0).upper()
         matching = [
             row for row in matching
-            if str(first_value(row, "customer", "customer_id", "customerid") or "").upper() == customer_id
+            if get_customer(row).upper() == customer_id
         ]
 
     # Refund questions
@@ -292,34 +265,77 @@ async def answer(request: Request):
         if str(row.get("status", "")).lower() == "paid"
     ]
 
-    # Which product earned the most revenue?
-    if "which product" in q or "which item" in q:
-        product_revenue = {}
+    wants_count = any(
+        word in q for word in ("count", "how many", "number of")
+    )
+
+    wants_average = any(
+        word in q for word in ("average", "avg", "mean", "typically worth")
+    )
+
+    # Top / best product or customer by revenue or orders
+    top_match = re.search(
+        r"(top|best|highest|most)\s*(?:[-\s])?(selling|revenue|revenue-generating|valuable)?\s*(product|item|customer)",
+        q
+    )
+
+    if top_match:
+        group = top_match.group(3)
+
+        if group in ("product", "item"):
+            key_func = get_product
+        else:
+            key_func = get_customer
+
+        totals = {}
 
         for row in paid:
-            name = str(first_value(row, "product", "product_name", "item"))
-            product_revenue[name] = (
-                product_revenue.get(name, 0)
-                + amount_in_usd(row)
-            )
+            name = key_func(row)
+            totals[name] = totals.get(name, 0) + amount_in_usd(row)
 
-        best_product = max(
-            product_revenue,
-            key=product_revenue.get
-        )
+        best = max(totals, key=totals.get)
+        return {"answer": best}
 
-        return {"answer": best_product}
+    # Which product/customer questions
+    if "which product" in q or "which item" in q:
+        totals = {}
 
-    # Average-value questions
-    if any(word in q for word in ("average", "avg", "mean", "typically worth")):
+        for row in paid:
+            name = get_product(row)
+            totals[name] = totals.get(name, 0) + amount_in_usd(row)
+
+        return {"answer": max(totals, key=totals.get)}
+
+    if "which customer" in q:
+        totals = {}
+
+        for row in paid:
+            name = get_customer(row)
+            totals[name] = totals.get(name, 0) + amount_in_usd(row)
+
+        return {"answer": max(totals, key=totals.get)}
+
+    # Average value
+    if wants_average:
         if not paid:
             return {"answer": 0}
 
-        average = sum(amount_in_usd(row) for row in paid) / len(paid)
-        return {"answer": round(average, 2)}
+        return {
+            "answer": round(
+                sum(amount_in_usd(row) for row in paid) / len(paid),
+                2
+            )
+        }
 
-    # Revenue / total-money questions
-    if any(word in q for word in ("revenue", "sales", "total", "amount", "spend", "spent", "worth")):
+    # Count questions
+    if wants_count:
+        return {"answer": len(matching)}
+
+    # Revenue / money questions
+    if any(
+        word in q
+        for word in ("revenue", "sales", "total", "amount", "spend", "spent", "worth", "earn", "earned")
+    ):
         return {
             "answer": round(
                 sum(amount_in_usd(row) for row in paid),
@@ -327,8 +343,5 @@ async def answer(request: Request):
             )
         }
 
-    # Count questions
-    if any(word in q for word in ("count", "how many", "number of")):
-        return {"answer": len(matching)}
-
+    # Default: count matching orders
     return {"answer": len(matching)}
