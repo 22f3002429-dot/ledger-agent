@@ -43,7 +43,6 @@ def load_data():
 
     rates_response = requests.get(links["rates"], timeout=20).json()
 
-    # Handles both {"USD": 1, ...} and {"rates": {"USD": 1, ...}}
     if isinstance(rates_response, dict):
         rates = rates_response.get("rates", rates_response)
     else:
@@ -130,21 +129,12 @@ def amount_in_usd(row):
     if currency == "USD":
         return amount
 
-    # Try direct rate: 1 currency = rate USD
     if currency in rates:
         try:
             return amount * float(rates[currency])
         except (TypeError, ValueError):
             pass
 
-    # Try inverse rate: 1 USD = rate currency
-    if currency in rates:
-        try:
-            return amount / float(rates[currency])
-        except (TypeError, ValueError):
-            pass
-
-    # If the rate table uses currency objects, such as {"INR": {"USD": 0.012}}
     currency_rate = rates.get(currency, {})
 
     if isinstance(currency_rate, dict):
@@ -155,7 +145,6 @@ def amount_in_usd(row):
                 except (TypeError, ValueError):
                     pass
 
-    # Last-resort fallback so the endpoint does not return HTTP 500.
     print(f"WARNING: No usable USD rate for {currency}; using original amount.")
     return amount
 
@@ -302,6 +291,24 @@ async def answer(request: Request):
         row for row in matching
         if str(row.get("status", "")).lower() == "paid"
     ]
+
+    # Which product earned the most revenue?
+    if "which product" in q or "which item" in q:
+        product_revenue = {}
+
+        for row in paid:
+            name = str(first_value(row, "product", "product_name", "item"))
+            product_revenue[name] = (
+                product_revenue.get(name, 0)
+                + amount_in_usd(row)
+            )
+
+        best_product = max(
+            product_revenue,
+            key=product_revenue.get
+        )
+
+        return {"answer": best_product}
 
     # Average-value questions
     if any(word in q for word in ("average", "avg", "mean", "typically worth")):
