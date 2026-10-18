@@ -246,21 +246,30 @@ async def answer(request: Request):
             )
         }
 
-    # Revenue questions: only paid orders count as revenue
-    if any(word in q for word in ("revenue", "sales", "total", "amount", "spend", "spent")):
-        matching = [
-            row for row in matching
-            if str(row.get("status", "")).lower() == "paid"
-        ]
+    # Paid orders for money calculations
+    paid = [
+        row for row in matching
+        if str(row.get("status", "")).lower() == "paid"
+    ]
 
+    # Average-value questions
+    if any(word in q for word in ("average", "avg", "mean", "typically worth")):
+        if not paid:
+            return {"answer": 0}
+
+        average = sum(amount_in_usd(row) for row in paid) / len(paid)
+        return {"answer": round(average, 2)}
+
+    # Revenue / total-money questions
+    if any(word in q for word in ("revenue", "sales", "total", "amount", "spend", "spent", "worth")):
         return {
             "answer": round(
-                sum(amount_in_usd(row) for row in matching),
+                sum(amount_in_usd(row) for row in paid),
                 2
             )
         }
 
-    # Count questions without the word "refund"
+    # Count questions
     if any(word in q for word in ("count", "how many", "number of")):
         return {"answer": len(matching)}
 
